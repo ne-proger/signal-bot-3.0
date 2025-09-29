@@ -1,0 +1,14 @@
+services:
+- type: worker
+name: crypto-signal-bot-3-0
+env: docker
+plan: starter
+autoDeploy: true
+region: frankfurt
+healthCheckPath:
+buildCommand: ""
+startCommand: "python -m src.main"
+envVars:
+- key: TZ
+value: Europe/Madrid
+# Остальные переменные задайте в панели Render Secrets (не в гите)

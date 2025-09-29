@@ -1,0 +1,8 @@
+printf '%s\n' \
+".env" \
+"secrets/" \
+"data/" \
+"__pycache__/" \
+"*.db" \
+".venv/" \
+>> .gitignore

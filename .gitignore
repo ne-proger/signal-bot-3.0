@@ -6,3 +6,19 @@ printf '%s\n' \
 "*.db" \
 ".venv/" \
 >> .gitignore
+
+cat > .gitignore <<'EOF'
+# virtualenv
+.venv/
+# python cache
+__pycache__/
+*.pyc
+# local env & secrets
+.env
+secrets/
+# local data / sqlite
+data/
+*.db
+# OS
+.DS_Store
+EOF

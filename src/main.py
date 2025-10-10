@@ -8,6 +8,18 @@ from typing import Optional
 from datetime import datetime
 
 from dotenv import load_dotenv
+
+# Sentry (опционально включается, если задан DSN)
+import sentry_sdk
+dsn = os.getenv("SENTRY_DSN", "").strip()
+if dsn:
+    sentry_sdk.init(
+        dsn=dsn,
+        traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.0")),
+        profiles_sample_rate=float(os.getenv("SENTRY_PROFILES_SAMPLE_RATE", "0.0")),
+    )
+
+
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 )

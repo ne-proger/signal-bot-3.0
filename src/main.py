@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 from typing import Optional
+from datetime import datetime
 
 from dotenv import load_dotenv
 from telegram import (
@@ -24,6 +25,7 @@ from src.utils import (
 )
 from src.scheduler import BotScheduler
 
+# --- BYBIT CLIENT ---
 try:
     from .bybit_client import BybitClient, BybitError  # type: ignore
 except Exception:
@@ -33,6 +35,7 @@ except Exception:
         def latest_ohlcv_pack(self, symbol: str, category: str = "spot"):
             return {"W": [], "D": [], "240": []}
 
+# --- LOGGING ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
 log = logging.getLogger("bot")
 
@@ -47,15 +50,22 @@ WELCOME = (
     "Команды:\n"
     "/settings — меню настроек (кнопки)\n"
     "/debugbtn — тест кнопок\n"
+    "/history — последние сигналы\n"
     "/setpairs BTCUSDT,TRXUSDT — задать пары\n"
     "/setfreq 5m|1h|1d — периодичность\n"
     "/setsens low|medium|high — чувствительность\n"
     "/setcat spot|linear — категория рынка\n"
     "/status — показать настройки\n"
     "/testonce — запустить проверку сейчас\n"
+    "/diag — диагностика (БД/сборка)\n"
 )
 
 FREQ_PRESETS = [("1m","60"),("5m","300"),("15m","900"),("1h","3600"),("4h","14400"),("1d","86400")]
+
+# CT-7: параметры антидублирования
+SIGNAL_COOLDOWN_HOURS = float(os.getenv("SIGNAL_COOLDOWN_HOURS", "6"))
+SIGNAL_TOLERANCE_PCT = float(os.getenv("SIGNAL_TOLERANCE_PCT", "0.5"))
+CONF_TOL = 0.03  # фиксированный допуск по confidence
 
 # ---------- helpers ----------
 async def ensure_user_row(user_id: int):
@@ -134,6 +144,25 @@ async def debugbtn_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔧 PING", callback_data="dbg:ping")]])
     await update.message.reply_text("Нажми кнопку — должен прийти callback.", reply_markup=kb)
 
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    assert update.effective_user and update.message and store is not None
+    rows = store.recent_signals(user_id=update.effective_user.id, limit=20)
+    if not rows:
+        await update.message.reply_text("История сигналов пуста.")
+        return
+    lines = ["🗂 Последние сигналы:"]
+    for r in rows:
+        ts = int(r["created_at"])
+        sym = r["symbol"]
+        conf = r["confidence"]
+        entry = r["entry"]; tp = r["take_profit"]; sl = r["stop_loss"]
+        horizon = r["exit_horizon"]
+        lines.append(
+            f"• {sym} | conf={conf if conf is not None else '—'} | "
+            f"entry={entry} | tp={tp} | sl={sl} | h={horizon} | t={ts}"
+        )
+    await update.message.reply_text("\n".join(lines))
+
 async def setpairs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     assert update.effective_user and update.message
     await ensure_user_row(update.effective_user.id)
@@ -196,12 +225,33 @@ async def testonce_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await run_check_for_user(update.effective_user.id, context)
     await update.message.reply_text("Тестовая проверка выполнена.")
 
+async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    assert store is not None
+    try:
+        rows = store.recent_signals(user_id=update.effective_user.id, limit=1)
+        count_hint = "≥1" if rows else "0"
+    except Exception as e:
+        count_hint = f"DB error: {e}"
+
+    db_url = os.getenv("DATABASE_URL", "")
+    if db_url:
+        db_url = db_url.replace(db_url.split("@")[0], "***://***:***")
+
+    build_ts = os.getenv("BUILD_AT", "") or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    await update.message.reply_text(
+        "🧪 DIAG\n"
+        f"DB: {'Postgres' if os.getenv('DATABASE_URL') else 'SQLite'}\n"
+        f"Signals(user): {count_hint}\n"
+        f"DATABASE_URL: {db_url or '—'}\n"
+        f"Build at: {build_ts}"
+    )
+
 # ---------- callbacks ----------
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     assert update.callback_query and update.effective_user
     q = update.callback_query
     data = (q.data or "").strip()
-    # тост в Telegram + лог
     try:
         await q.answer(text=f"callback: {data}", show_alert=False)
     except Exception:
@@ -237,7 +287,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ParseError as e:
         await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Ошибка: {e}")
 
-    # Отправим актуальное меню
     await _send_settings_menu(update, context)
 
 # ---------- ввод пар после pairs:edit ----------
@@ -301,6 +350,7 @@ async def run_check_for_user(user_id: int, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=user_id, text=f"[DATA ERROR] {sym}: {tf_errors}")
             continue
 
+        # ---- LLM анализ ----
         try:
             res = analyze_and_decide(
                 symbol=sym,
@@ -317,25 +367,69 @@ async def run_check_for_user(user_id: int, context: ContextTypes.DEFAULT_TYPE):
 
         buy = bool(res.get("buy_signal"))
         rationale = res.get("rationale", "")
+
         if buy:
-            conf = float(res.get("confidence", 0.0) or 0.0)
+            conf = res.get("confidence", 0.0)
+            try:
+                conf_f = float(conf) if conf is not None else 0.0
+            except Exception:
+                conf_f = 0.0
+
             entry = res.get("entry"); tp = res.get("take_profit"); sl = res.get("stop_loss"); horizon = res.get("exit_horizon")
-            if conf >= conf_threshold:
+
+            if conf_f >= conf_threshold:
+                # CT-7: антидубль
+                assert store is not None
+                is_dup = store.is_duplicate_like(
+                    user_id=user_id,
+                    symbol=sym,
+                    new_conf=conf_f,
+                    new_entry=(float(entry) if entry is not None else None),
+                    new_tp=(float(tp) if tp is not None else None),
+                    new_sl=(float(sl) if sl is not None else None),
+                    cooldown_hours=SIGNAL_COOLDOWN_HOURS,
+                    tol_pct=SIGNAL_TOLERANCE_PCT,
+                    conf_tol=CONF_TOL,
+                )
+                if is_dup:
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=f"[DUP FILTERED] {sym}: сигнал похож на недавний (окно {SIGNAL_COOLDOWN_HOURS}ч, допуск {SIGNAL_TOLERANCE_PCT}%)."
+                    )
+                    continue
+
+                # публикуем
                 msg = (
                     f"🔔 SIGNAL BUY — {sym}\n"
                     f"entry: {entry}\n"
                     f"take_profit: {tp}\n"
                     f"stop_loss: {sl}\n"
                     f"exit_horizon: {horizon}\n"
-                    f"confidence: {conf:.2f}\n"
+                    f"confidence: {conf_f:.2f}\n"
                     f"rationale: {rationale}"
                 )
                 if channel_id:
-                    try: await context.bot.send_message(chat_id=channel_id, text=msg)
-                    except Exception as e: log.error("Не удалось отправить сигнал в канал: %s", e)
-                await context.bot.send_message(chat_id=user_id, text=f"[SIGNAL] {sym}: buy (confidence {conf:.2f}) — опубликовано.")
+                    try:
+                        await context.bot.send_message(chat_id=channel_id, text=msg)
+                    except Exception as e:
+                        log.error("Не удалось отправить сигнал в канал: %s", e)
+
+                # залогируем сигнал
+                store.log_signal(
+                    user_id=user_id, symbol=sym, signal_type="buy",
+                    confidence=conf_f,
+                    entry=(float(entry) if entry is not None else None),
+                    take_profit=(float(tp) if tp is not None else None),
+                    stop_loss=(float(sl) if sl is not None else None),
+                    exit_horizon=(horizon if horizon is not None else None),
+                )
+
+                await context.bot.send_message(chat_id=user_id, text=f"[SIGNAL] {sym}: buy (confidence {conf_f:.2f}) — опубликовано.")
             else:
-                await context.bot.send_message(chat_id=user_id, text=f"[FILTERED] {sym}: buy confidence {conf:.2f} ниже порога {conf_threshold:.2f} для {sens}")
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"[FILTERED] {sym}: buy confidence {conf_f:.2f} ниже порога {conf_threshold:.2f} для {sens}"
+                )
         else:
             await context.bot.send_message(chat_id=user_id, text=f"[NO SIGNAL] {sym}: {rationale}")
 
@@ -348,7 +442,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     log.error("Exception in handler", exc_info=context.error)
 
 async def debug_update_logger(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # логируем типы апдейтов на всякий случай
     try:
         t = None
         if update.message: t = "message"
@@ -359,6 +452,14 @@ async def debug_update_logger(update: Update, context: ContextTypes.DEFAULT_TYPE
         log.info("update type: %s", t)
     except Exception:
         pass
+
+# --- префлайт: удаляем вебхук перед polling, чтобы не было конфликтов ---
+async def _preflight(app):
+    try:
+        await app.bot.delete_webhook(drop_pending_updates=True)
+        log.info("Webhook deleted (preflight).")
+    except Exception as e:
+        log.warning("delete_webhook failed: %s", e)
 
 def main():
     global settings, store, scheduler, bybit
@@ -375,19 +476,21 @@ def main():
     store = Storage()
     scheduler = BotScheduler(application)
 
-    # --- handlers order matters ---
-    application.add_handler(CallbackQueryHandler(on_callback, pattern=".*"), group=0)  # ловим все колбэки
-    application.add_handler(TypeHandler(Update, debug_update_logger), group=1)  # диагностический лог
+    # --- handlers order ---
+    application.add_handler(CallbackQueryHandler(on_callback, pattern=".*"), group=0)
+    application.add_handler(TypeHandler(Update, debug_update_logger), group=1)
 
     application.add_handler(CommandHandler("start", start_cmd))
     application.add_handler(CommandHandler("status", status_cmd))
     application.add_handler(CommandHandler("settings", settings_cmd))
     application.add_handler(CommandHandler("debugbtn", debugbtn_cmd))
+    application.add_handler(CommandHandler("history", history_cmd))
     application.add_handler(CommandHandler("setpairs", setpairs_cmd))
     application.add_handler(CommandHandler("setfreq", setfreq_cmd))
     application.add_handler(CommandHandler("setsens", setsens_cmd))
     application.add_handler(CommandHandler("setcat", setcat_cmd))
     application.add_handler(CommandHandler("testonce", testonce_cmd))
+    application.add_handler(CommandHandler("diag", diag_cmd))
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_pairs_message), group=2)
 
@@ -397,11 +500,15 @@ def main():
         log.error("Не удалось создать BybitClient: %s", e)
         bybit = BybitClient()
 
+    # восстановим задачи расписания
     try:
         for user_id, _pairs, freq, _sens, _cat in store.all_users():
             asyncio.get_event_loop().run_until_complete(scheduler.upsert_user_job(user_id, freq, check_job))
     except Exception as e:
         log.warning("Не удалось восстановить задачи: %s", e)
+
+    # префлайт: на всякий случай снимаем вебхук перед polling
+    asyncio.get_event_loop().run_until_complete(_preflight(application))
 
     log.info("Бот запущен. Ожидаю команды…")
     try:

@@ -63,6 +63,7 @@ WELCOME = (
     "/testonce — запустить проверку сейчас\n"
     "/diag — диагностика (БД/сборка)\n"
     "/sentrytest — отправить тестовое событие в Sentry\n"
+    "/sentryboom — намеренно сгенерировать исключение (проверка Sentry)\n"
 )
 
 FREQ_PRESETS = [("1m","60"),("5m","300"),("15m","900"),("1h","3600"),("4h","14400"),("1d","86400")]
@@ -252,19 +253,21 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Build at: {build_ts}"
     )
 
-# --- Sentry manual test command ---
 async def sentrytest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отправляю тестовое событие в Sentry…")
     try:
         import sentry_sdk
         sentry_sdk.capture_message("🔔 Manual test message from /sentrytest")
         sentry_sdk.flush(timeout=5)
-        # Для проверки исключений можно временно раскомментировать:
-        # raise RuntimeError("🔥 Manual test exception from /sentrytest")
     except Exception as e:
         await update.message.reply_text(f"Sentry not available or failed: {e}")
         return
     await update.message.reply_text("Готово. Проверь Sentry → Issues.")
+
+# Намеренное исключение для Verify шага в Sentry
+async def sentryboom_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("💥 Генерирую исключение для проверки Sentry…")
+    _ = 1 / 0  # ZeroDivisionError
 
 # ---------- callbacks ----------
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -460,7 +463,16 @@ async def run_check_for_user(user_id: int, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- error & debug ----------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # лог в консоль/логи Render
     log.error("Exception in handler", exc_info=context.error)
+    # отправка в Sentry (если настроен DSN)
+    try:
+        import sentry_sdk
+        if context.error:
+            sentry_sdk.capture_exception(context.error)
+            sentry_sdk.flush(timeout=5)
+    except Exception:
+        pass
 
 async def debug_update_logger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -538,6 +550,7 @@ def main():
     application.add_handler(CommandHandler("testonce", testonce_cmd))
     application.add_handler(CommandHandler("diag", diag_cmd))
     application.add_handler(CommandHandler("sentrytest", sentrytest_cmd))
+    application.add_handler(CommandHandler("sentryboom", sentryboom_cmd))
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_pairs_message), group=2)
 

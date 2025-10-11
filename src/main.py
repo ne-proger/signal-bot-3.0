@@ -523,6 +523,11 @@ def main():
     asyncio.get_event_loop().run_until_complete(_preflight(application))
 
     log.info("Бот запущен. Ожидаю команды…")
+    # Отправляем тестовую ошибку
+    import sentry_sdk
+    sentry_sdk.capture_message("Sentry test event triggered manually")
+
+    
     try:
         application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
     except Conflict:

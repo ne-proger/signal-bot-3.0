@@ -9,17 +9,6 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 
-# Sentry (опционально включается, если задан DSN)
-import sentry_sdk
-dsn = os.getenv("SENTRY_DSN", "").strip()
-if dsn:
-    sentry_sdk.init(
-        dsn=dsn,
-        traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.0")),
-        profiles_sample_rate=float(os.getenv("SENTRY_PROFILES_SAMPLE_RATE", "0.0")),
-    )
-
-
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 )
@@ -48,7 +37,10 @@ except Exception:
             return {"W": [], "D": [], "240": []}
 
 # --- LOGGING ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
 log = logging.getLogger("bot")
 
 # --- globals ---
@@ -70,6 +62,7 @@ WELCOME = (
     "/status — показать настройки\n"
     "/testonce — запустить проверку сейчас\n"
     "/diag — диагностика (БД/сборка)\n"
+    "/sentrytest — отправить тестовое событие в Sentry\n"
 )
 
 FREQ_PRESETS = [("1m","60"),("5m","300"),("15m","900"),("1h","3600"),("4h","14400"),("1d","86400")]
@@ -259,6 +252,20 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Build at: {build_ts}"
     )
 
+# --- Sentry manual test command ---
+async def sentrytest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Отправляю тестовое событие в Sentry…")
+    try:
+        import sentry_sdk
+        sentry_sdk.capture_message("🔔 Manual test message from /sentrytest")
+        sentry_sdk.flush(timeout=5)
+        # Для проверки исключений можно временно раскомментировать:
+        # raise RuntimeError("🔥 Manual test exception from /sentrytest")
+    except Exception as e:
+        await update.message.reply_text(f"Sentry not available or failed: {e}")
+        return
+    await update.message.reply_text("Готово. Проверь Sentry → Issues.")
+
 # ---------- callbacks ----------
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     assert update.callback_query and update.effective_user
@@ -446,8 +453,10 @@ async def run_check_for_user(user_id: int, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=user_id, text=f"[NO SIGNAL] {sym}: {rationale}")
 
     if lines:
-        try: await context.bot.send_message(chat_id=user_id, text="\n".join(lines))
-        except Exception as e: log.error("Не удалось отправить сводку пользователю %s: %s", user_id, e)
+        try:
+            await context.bot.send_message(chat_id=user_id, text="\n".join(lines))
+        except Exception as e:
+            log.error("Не удалось отправить сводку пользователю %s: %s", user_id, e)
 
 # ---------- error & debug ----------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -475,9 +484,33 @@ async def _preflight(app):
 
 def main():
     global settings, store, scheduler, bybit
+
+    # Загружаем .env и настройки
     load_dotenv()
     settings = Settings.load()
 
+    # --- Sentry init (если задан DSN) ---
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.logging import LoggingIntegration
+
+        dsn = (os.getenv("SENTRY_DSN") or "").strip()
+        if dsn:
+            sentry_sdk.init(
+                dsn=dsn,
+                environment=os.getenv("SENTRY_ENV", "prod"),
+                release=os.getenv("GIT_SHA", "local"),
+                integrations=[LoggingIntegration(level=logging.INFO, event_level=logging.ERROR)],
+                traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.0")),
+                profiles_sample_rate=float(os.getenv("SENTRY_PROFILES_SAMPLE_RATE", "0.0")),
+            )
+            log.info("Sentry initialized: env=%s, release=%s", os.getenv("SENTRY_ENV", "prod"), os.getenv("GIT_SHA", "local"))
+        else:
+            log.info("Sentry DSN is empty — Sentry disabled.")
+    except Exception as e:
+        log.warning("Sentry init failed: %s", e)
+
+    # Token TG
     token = os.getenv("TELEGRAM_BOT_TOKEN") or (settings.telegram_bot_token if settings else None)
     if not token:
         raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN")
@@ -485,6 +518,7 @@ def main():
     application = ApplicationBuilder().token(token).concurrent_updates(True).build()
     application.add_error_handler(error_handler)
 
+    # Хранилище и планировщик
     store = Storage()
     scheduler = BotScheduler(application)
 
@@ -503,9 +537,11 @@ def main():
     application.add_handler(CommandHandler("setcat", setcat_cmd))
     application.add_handler(CommandHandler("testonce", testonce_cmd))
     application.add_handler(CommandHandler("diag", diag_cmd))
+    application.add_handler(CommandHandler("sentrytest", sentrytest_cmd))
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_pairs_message), group=2)
 
+    # Bybit client
     try:
         bybit = BybitClient(proxy_url=settings.proxy_url) if settings else BybitClient()
     except Exception as e:
@@ -515,48 +551,21 @@ def main():
     # восстановим задачи расписания
     try:
         for user_id, _pairs, freq, _sens, _cat in store.all_users():
-            asyncio.get_event_loop().run_until_complete(scheduler.upsert_user_job(user_id, freq, check_job))
+            asyncio.get_event_loop().run_until_complete(
+                scheduler.upsert_user_job(user_id, freq, check_job)
+            )
     except Exception as e:
         log.warning("Не удалось восстановить задачи: %s", e)
 
     # префлайт: на всякий случай снимаем вебхук перед polling
     asyncio.get_event_loop().run_until_complete(_preflight(application))
 
-log.info("Бот запущен. Ожидаю команды…")
-
-# === ТЕСТОВАЯ ОШИБКА ДЛЯ ПРОВЕРКИ SENTRY ===
-try:
-    import sentry_sdk
-    sentry_sdk.capture_message("✅ Test event from crypto-signal-bot sent to Sentry")
-    # Если хочешь убедиться, что Sentry ловит реальные исключения:
-    # raise RuntimeError("🔥 Manual test error for Sentry verification")
-except Exception as e:
-    log.warning("Не удалось отправить тестовое сообщение в Sentry: %s", e)
-# === КОНЕЦ ТЕСТА ===
-
-try:
-    application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-except Conflict:
-    log.error("Conflict: другой экземпляр уже запущен. Остановите его или смените токен.")
-    raise
-log.info("Бот запущен. Ожидаю команды…")
-
-# === ТЕСТОВАЯ ОШИБКА ДЛЯ ПРОВЕРКИ SENTRY ===
-try:
-    import sentry_sdk
-    sentry_sdk.capture_message("✅ Test event from crypto-signal-bot sent to Sentry")
-    # Если хочешь убедиться, что Sentry ловит реальные исключения:
-    # raise RuntimeError("🔥 Manual test error for Sentry verification")
-except Exception as e:
-    log.warning("Не удалось отправить тестовое сообщение в Sentry: %s", e)
-# === КОНЕЦ ТЕСТА ===
-
-try:
-    application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-except Conflict:
-    log.error("Conflict: другой экземпляр уже запущен. Остановите его или смените токен.")
-    raise
-
+    log.info("Бот запущен. Ожидаю команды…")
+    try:
+        application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    except Conflict:
+        log.error("Conflict: другой экземпляр уже запущен. Остановите его или смените токен.")
+        raise
 
 if __name__ == "__main__":
     main()

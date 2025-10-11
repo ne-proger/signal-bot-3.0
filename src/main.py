@@ -522,17 +522,41 @@ def main():
     # префлайт: на всякий случай снимаем вебхук перед polling
     asyncio.get_event_loop().run_until_complete(_preflight(application))
 
-    log.info("Бот запущен. Ожидаю команды…")
-    # Отправляем тестовую ошибку
-    import sentry_sdk
-    sentry_sdk.capture_message("Sentry test event triggered manually")
+log.info("Бот запущен. Ожидаю команды…")
 
-    
-    try:
-        application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
-    except Conflict:
-        log.error("Conflict: другой экземпляр уже запущен. Остановите его или смените токен.")
-        raise
+# === ТЕСТОВАЯ ОШИБКА ДЛЯ ПРОВЕРКИ SENTRY ===
+try:
+    import sentry_sdk
+    sentry_sdk.capture_message("✅ Test event from crypto-signal-bot sent to Sentry")
+    # Если хочешь убедиться, что Sentry ловит реальные исключения:
+    # raise RuntimeError("🔥 Manual test error for Sentry verification")
+except Exception as e:
+    log.warning("Не удалось отправить тестовое сообщение в Sentry: %s", e)
+# === КОНЕЦ ТЕСТА ===
+
+try:
+    application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+except Conflict:
+    log.error("Conflict: другой экземпляр уже запущен. Остановите его или смените токен.")
+    raise
+log.info("Бот запущен. Ожидаю команды…")
+
+# === ТЕСТОВАЯ ОШИБКА ДЛЯ ПРОВЕРКИ SENTRY ===
+try:
+    import sentry_sdk
+    sentry_sdk.capture_message("✅ Test event from crypto-signal-bot sent to Sentry")
+    # Если хочешь убедиться, что Sentry ловит реальные исключения:
+    # raise RuntimeError("🔥 Manual test error for Sentry verification")
+except Exception as e:
+    log.warning("Не удалось отправить тестовое сообщение в Sentry: %s", e)
+# === КОНЕЦ ТЕСТА ===
+
+try:
+    application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+except Conflict:
+    log.error("Conflict: другой экземпляр уже запущен. Остановите его или смените токен.")
+    raise
+
 
 if __name__ == "__main__":
     main()

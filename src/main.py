@@ -245,13 +245,22 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     build_ts = os.getenv("BUILD_AT", "") or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
+    sentry_on = "off"
+    try:
+        import sentry_sdk  # noqa
+        sentry_on = "on" if (os.getenv("SENTRY_DSN") or "").strip() else "off"
+    except Exception:
+        sentry_on = "not installed"
+
     await update.message.reply_text(
         "🧪 DIAG\n"
         f"DB: {'Postgres' if os.getenv('DATABASE_URL') else 'SQLite'}\n"
         f"Signals(user): {count_hint}\n"
         f"DATABASE_URL: {db_url or '—'}\n"
+        f"Sentry: {sentry_on}\n"
         f"Build at: {build_ts}"
     )
+
 
 async def sentrytest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отправляю тестовое событие в Sentry…")
@@ -264,10 +273,20 @@ async def sentrytest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text("Готово. Проверь Sentry → Issues.")
 
-# Намеренное исключение для Verify шага в Sentry
+# Намеренное исключение: отправляем как error-event в Sentry и не падаем
 async def sentryboom_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("💥 Генерирую исключение для проверки Sentry…")
-    _ = 1 / 0  # ZeroDivisionError
+    await update.message.reply_text("💥 Генерирую исключение и отправляю в Sentry как error-event…")
+    try:
+        1 / 0  # ZeroDivisionError
+    except Exception as e:
+        try:
+            import sentry_sdk
+            sentry_sdk.capture_exception(e)   # ← именно exception, не message
+            sentry_sdk.flush(timeout=5)       # дождёмся отправки
+            await update.message.reply_text("Готово. Проверь Sentry → Issues.")
+        except Exception as sx:
+            await update.message.reply_text(f"Sentry недоступен или не сконфигурирован: {sx}")
+
 
 # ---------- callbacks ----------
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):

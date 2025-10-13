@@ -261,19 +261,18 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Build at: {build_ts}"
     )
 
-
 async def sentrytest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отправляю тестовое событие в Sentry…")
     try:
         import sentry_sdk
-        sentry_sdk.capture_message("🔔 Manual test message from /sentrytest")
-        sentry_sdk.flush(timeout=5)
+        sentry_sdk.capture_message("✅ Manual test message from /sentrytest")
+        sentry_sdk.flush(timeout=10.0)  # дождаться отправки
+        eid = sentry_sdk.last_event_id()
+        await update.message.reply_text(f"Готово. event_id={eid or '—'}. Проверь Sentry → Issues.")
     except Exception as e:
-        await update.message.reply_text(f"Sentry not available or failed: {e}")
-        return
-    await update.message.reply_text("Готово. Проверь Sentry → Issues.")
+        await update.message.reply_text(f"Sentry недоступен или не сконфигурирован: {e}")
 
-# Намеренное исключение: отправляем как error-event в Sentry и не падаем
+
 async def sentryboom_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("💥 Генерирую исключение и отправляю в Sentry как error-event…")
     try:
@@ -281,9 +280,10 @@ async def sentryboom_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         try:
             import sentry_sdk
-            sentry_sdk.capture_exception(e)   # ← именно exception, не message
-            sentry_sdk.flush(timeout=5)       # дождёмся отправки
-            await update.message.reply_text("Готово. Проверь Sentry → Issues.")
+            sentry_sdk.capture_exception(e)
+            sentry_sdk.flush(timeout=10.0)
+            eid = sentry_sdk.last_event_id()
+            await update.message.reply_text(f"Готово. event_id={eid or '—'}. Проверь Sentry → Issues.")
         except Exception as sx:
             await update.message.reply_text(f"Sentry недоступен или не сконфигурирован: {sx}")
 
@@ -520,26 +520,37 @@ def main():
     load_dotenv()
     settings = Settings.load()
 
-    # --- Sentry init (если задан DSN) ---
-    try:
-        import sentry_sdk
-        from sentry_sdk.integrations.logging import LoggingIntegration
+# --- Sentry init (если задан DSN) ---
+try:
+    import sentry_sdk
+    from sentry_sdk.integrations.logging import LoggingIntegration
 
-        dsn = (os.getenv("SENTRY_DSN") or "").strip()
-        if dsn:
-            sentry_sdk.init(
-                dsn=dsn,
-                environment=os.getenv("SENTRY_ENV", "prod"),
-                release=os.getenv("GIT_SHA", "local"),
-                integrations=[LoggingIntegration(level=logging.INFO, event_level=logging.ERROR)],
-                traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.0")),
-                profiles_sample_rate=float(os.getenv("SENTRY_PROFILES_SAMPLE_RATE", "0.0")),
-            )
-            log.info("Sentry initialized: env=%s, release=%s", os.getenv("SENTRY_ENV", "prod"), os.getenv("GIT_SHA", "local"))
-        else:
-            log.info("Sentry DSN is empty — Sentry disabled.")
-    except Exception as e:
-        log.warning("Sentry init failed: %s", e)
+    dsn = (os.getenv("SENTRY_DSN") or "").strip()
+    if dsn:
+        sentry_sdk.init(
+            dsn=dsn,
+            environment=os.getenv("SENTRY_ENV", "prod"),
+            release=os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_SHA", "local"),
+            server_name=os.getenv("RENDER_SERVICE_ID", "local"),
+            debug=True,                 # печатаем подробные логи транспорта в Render Logs
+            attach_stacktrace=True,     # прикрепляем стектрейс даже к message-событиям
+            integrations=[LoggingIntegration(level=logging.INFO, event_level=logging.ERROR)],
+            traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0")),
+            profiles_sample_rate=float(os.getenv("SENTRY_PROFILES_SAMPLE_RATE", "0")),
+        )
+        # полезные теги для фильтрации
+        sentry_sdk.set_tag("service", "crypto-signal-bot")
+        sentry_sdk.set_tag("region", os.getenv("RENDER_REGION", ""))
+        log.info(
+            "Sentry initialized: env=%s, release=%s",
+            os.getenv("SENTRY_ENV", "prod"),
+            os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_SHA", "local"),
+        )
+    else:
+        log.info("Sentry disabled (empty DSN).")
+except Exception as e:
+    log.warning("Sentry init failed: %s", e)
+
 
     # Token TG
     token = os.getenv("TELEGRAM_BOT_TOKEN") or (settings.telegram_bot_token if settings else None)

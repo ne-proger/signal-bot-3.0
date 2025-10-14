@@ -1,17 +1,13 @@
 # src/main.py
 from __future__ import annotations
-from .analysis import analyze_and_decide
 import asyncio
 import logging
 import os
-from typing import Optional
 from datetime import datetime
+from typing import Optional
 
 from dotenv import load_dotenv
-
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, ContextTypes,
     CallbackQueryHandler, MessageHandler, TypeHandler, filters
@@ -20,13 +16,14 @@ from telegram.error import Conflict
 
 from src.config import Settings
 from src.storage import Storage
+from src.scheduler import BotScheduler
 from src.utils import (
     parse_frequency, norm_pairs, validate_sensitivity, ParseError,
     validate_category, CONF_THRESHOLDS
 )
-from src.scheduler import BotScheduler
+from .analysis import analyze_and_decide
 
-# --- BYBIT CLIENT ---
+# --- BYBIT CLIENT (fallback, если модуль недоступен) ---
 try:
     from .bybit_client import BybitClient, BybitError  # type: ignore
 except Exception:
@@ -62,16 +59,16 @@ WELCOME = (
     "/status — показать настройки\n"
     "/testonce — запустить проверку сейчас\n"
     "/diag — диагностика (БД/сборка)\n"
-    "/sentrytest — отправить тестовое событие в Sentry\n"
-    "/sentryboom — намеренно сгенерировать исключение (проверка Sentry)\n"
+    "/sentrytest — тестовое событие в Sentry\n"
+    "/sentryboom — принудительная ошибка для Sentry\n"
 )
 
 FREQ_PRESETS = [("1m","60"),("5m","300"),("15m","900"),("1h","3600"),("4h","14400"),("1d","86400")]
 
-# CT-7: параметры антидублирования
+# Антидублирование
 SIGNAL_COOLDOWN_HOURS = float(os.getenv("SIGNAL_COOLDOWN_HOURS", "6"))
 SIGNAL_TOLERANCE_PCT = float(os.getenv("SIGNAL_TOLERANCE_PCT", "0.5"))
-CONF_TOL = 0.03  # фиксированный допуск по confidence
+CONF_TOL = 0.03
 
 # ---------- helpers ----------
 async def ensure_user_row(user_id: int):
@@ -97,7 +94,6 @@ def _build_settings_keyboard(current: dict) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([freq_row, sens_row, cat_row, pairs_row])
 
 async def _send_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Всегда отправляем НОВОЕ сообщение с меню."""
     assert store is not None and scheduler is not None
     user_id = update.effective_user.id  # type: ignore[union-attr]
     if store.get_user(user_id) is None:
@@ -164,8 +160,7 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         entry = r["entry"]; tp = r["take_profit"]; sl = r["stop_loss"]
         horizon = r["exit_horizon"]
         lines.append(
-            f"• {sym} | conf={conf if conf is not None else '—'} | "
-            f"entry={entry} | tp={tp} | sl={sl} | h={horizon} | t={ts}"
+            f"• {sym} | conf={conf if conf is not None else '—'} | entry={entry} | tp={tp} | sl={sl} | h={horizon} | t={ts}"
         )
     await update.message.reply_text("\n".join(lines))
 
@@ -265,81 +260,25 @@ async def sentrytest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Отправляю тестовое событие в Sentry…")
     try:
         import sentry_sdk
-        sentry_sdk.capture_message("✅ Manual test message from /sentrytest")
-        sentry_sdk.flush(timeout=10.0)  # дождаться отправки
-        eid = sentry_sdk.last_event_id()
-        await update.message.reply_text(f"Готово. event_id={eid or '—'}. Проверь Sentry → Issues.")
+        sentry_sdk.capture_message("🔔 Manual test message from /sentrytest")
+        sentry_sdk.flush(timeout=5)
     except Exception as e:
-        await update.message.reply_text(f"Sentry недоступен или не сконфигурирован: {e}")
-
+        await update.message.reply_text(f"Sentry not available or failed: {e}")
+        return
+    await update.message.reply_text("Готово. Проверь Sentry → Issues.")
 
 async def sentryboom_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("💥 Генерирую исключение и отправляю в Sentry как error-event…")
     try:
-        1 / 0  # ZeroDivisionError
+        1 / 0
     except Exception as e:
         try:
             import sentry_sdk
             sentry_sdk.capture_exception(e)
-            sentry_sdk.flush(timeout=10.0)
-            eid = sentry_sdk.last_event_id()
-            await update.message.reply_text(f"Готово. event_id={eid or '—'}. Проверь Sentry → Issues.")
+            sentry_sdk.flush(timeout=5)
+            await update.message.reply_text("Готово. Проверь Sentry → Issues.")
         except Exception as sx:
             await update.message.reply_text(f"Sentry недоступен или не сконфигурирован: {sx}")
-
-
-# ---------- callbacks ----------
-async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    assert update.callback_query and update.effective_user
-    q = update.callback_query
-    data = (q.data or "").strip()
-    try:
-        await q.answer(text=f"callback: {data}", show_alert=False)
-    except Exception:
-        pass
-    log.info("callback: %s", data)
-
-    assert store is not None and scheduler is not None
-    try:
-        if data.startswith("freq:"):
-            seconds = int(data.split(":", 1)[1])
-            store.upsert_user(update.effective_user.id, frequency_seconds=seconds)
-            await scheduler.upsert_user_job(update.effective_user.id, seconds, check_job)
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f"⏱ Периодичность: {seconds} сек")
-        elif data.startswith("sens:"):
-            val = validate_sensitivity(data.split(":", 1)[1])
-            store.upsert_user(update.effective_user.id, sensitivity=val)
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f"🎚 Чувствительность: {val}")
-        elif data.startswith("cat:"):
-            cat = validate_category(data.split(":", 1)[1])
-            store.upsert_user(update.effective_user.id, category=cat)
-            await context.bot.send_message(chat_id=update.effective_chat.id, text=f"🪙 Категория: {cat}")
-        elif data == "dbg:ping":
-            await context.bot.send_message(chat_id=update.effective_chat.id, text="🏓 pong")
-        elif data == "pairs:edit":
-            context.user_data["await_pairs"] = True
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="Введите пары через запятую, например: BTCUSDT,TRXUSDT,INJUSDT",
-                reply_markup=ReplyKeyboardRemove()
-            )
-        else:
-            await context.bot.send_message(chat_id=update.effective_chat.id, text="Неизвестная команда кнопки.")
-    except ParseError as e:
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"Ошибка: {e}")
-
-    await _send_settings_menu(update, context)
-
-# ---------- ввод пар после pairs:edit ----------
-async def on_pairs_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.user_data.get("await_pairs"):
-        return
-    assert update.message and update.effective_user and store is not None
-    pairs = norm_pairs(update.message.text or "")
-    store.upsert_user(update.effective_user.id, pairs=pairs)
-    context.user_data["await_pairs"] = False
-    await update.message.reply_text(f"✅ Пары обновлены: {pairs}", reply_markup=ReplyKeyboardRemove())
-    await _send_settings_menu(update, context)
 
 # ---------- джобы / проверка ----------
 async def check_job(context: ContextTypes.DEFAULT_TYPE):
@@ -391,7 +330,6 @@ async def run_check_for_user(user_id: int, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=user_id, text=f"[DATA ERROR] {sym}: {tf_errors}")
             continue
 
-        # ---- LLM анализ ----
         try:
             res = analyze_and_decide(
                 symbol=sym,
@@ -419,7 +357,6 @@ async def run_check_for_user(user_id: int, context: ContextTypes.DEFAULT_TYPE):
             entry = res.get("entry"); tp = res.get("take_profit"); sl = res.get("stop_loss"); horizon = res.get("exit_horizon")
 
             if conf_f >= conf_threshold:
-                # CT-7: антидубль
                 assert store is not None
                 is_dup = store.is_duplicate_like(
                     user_id=user_id,
@@ -439,7 +376,6 @@ async def run_check_for_user(user_id: int, context: ContextTypes.DEFAULT_TYPE):
                     )
                     continue
 
-                # публикуем
                 msg = (
                     f"🔔 SIGNAL BUY — {sym}\n"
                     f"entry: {entry}\n"
@@ -455,7 +391,6 @@ async def run_check_for_user(user_id: int, context: ContextTypes.DEFAULT_TYPE):
                     except Exception as e:
                         log.error("Не удалось отправить сигнал в канал: %s", e)
 
-                # залогируем сигнал
                 store.log_signal(
                     user_id=user_id, symbol=sym, signal_type="buy",
                     confidence=conf_f,
@@ -482,9 +417,7 @@ async def run_check_for_user(user_id: int, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- error & debug ----------
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # лог в консоль/логи Render
     log.error("Exception in handler", exc_info=context.error)
-    # отправка в Sentry (если настроен DSN)
     try:
         import sentry_sdk
         if context.error:
@@ -505,7 +438,7 @@ async def debug_update_logger(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception:
         pass
 
-# --- префлайт: удаляем вебхук перед polling, чтобы не было конфликтов ---
+# --- префлайт: удаляем вебхук перед polling ---
 async def _preflight(app):
     try:
         await app.bot.delete_webhook(drop_pending_updates=True)
@@ -516,43 +449,22 @@ async def _preflight(app):
 def main():
     global settings, store, scheduler, bybit
 
-    # Загружаем .env и настройки
     load_dotenv()
     settings = Settings.load()
 
-# --- Sentry init (если задан DSN) ---
-try:
-    import sentry_sdk
-    from sentry_sdk.integrations.logging import LoggingIntegration
+    # Sentry (минимальная инициализация — без профилинга/трейсов)
+    try:
+        dsn = (os.getenv("SENTRY_DSN") or "").strip()
+        if dsn:
+            import sentry_sdk
+            sentry_sdk.init(dsn=dsn, environment=os.getenv("SENTRY_ENV", "prod"))
+            log.info("Sentry initialized: env=%s, release=%s",
+                     os.getenv("SENTRY_ENV", "prod"), os.getenv("GIT_SHA", "local"))
+        else:
+            log.info("Sentry DSN empty — disabled.")
+    except Exception as e:
+        log.warning("Sentry init failed: %s", e)
 
-    dsn = (os.getenv("SENTRY_DSN") or "").strip()
-    if dsn:
-        sentry_sdk.init(
-            dsn=dsn,
-            environment=os.getenv("SENTRY_ENV", "prod"),
-            release=os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_SHA", "local"),
-            server_name=os.getenv("RENDER_SERVICE_ID", "local"),
-            debug=True,                 # печатаем подробные логи транспорта в Render Logs
-            attach_stacktrace=True,     # прикрепляем стектрейс даже к message-событиям
-            integrations=[LoggingIntegration(level=logging.INFO, event_level=logging.ERROR)],
-            traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0")),
-            profiles_sample_rate=float(os.getenv("SENTRY_PROFILES_SAMPLE_RATE", "0")),
-        )
-        # полезные теги для фильтрации
-        sentry_sdk.set_tag("service", "crypto-signal-bot")
-        sentry_sdk.set_tag("region", os.getenv("RENDER_REGION", ""))
-        log.info(
-            "Sentry initialized: env=%s, release=%s",
-            os.getenv("SENTRY_ENV", "prod"),
-            os.getenv("RENDER_GIT_COMMIT") or os.getenv("GIT_SHA", "local"),
-        )
-    else:
-        log.info("Sentry disabled (empty DSN).")
-except Exception as e:
-    log.warning("Sentry init failed: %s", e)
-
-
-    # Token TG
     token = os.getenv("TELEGRAM_BOT_TOKEN") or (settings.telegram_bot_token if settings else None)
     if not token:
         raise RuntimeError("Не задан TELEGRAM_BOT_TOKEN")
@@ -560,11 +472,10 @@ except Exception as e:
     application = ApplicationBuilder().token(token).concurrent_updates(True).build()
     application.add_error_handler(error_handler)
 
-    # Хранилище и планировщик
     store = Storage()
     scheduler = BotScheduler(application)
 
-    # --- handlers order ---
+    # Handlers
     application.add_handler(CallbackQueryHandler(on_callback, pattern=".*"), group=0)
     application.add_handler(TypeHandler(Update, debug_update_logger), group=1)
 
@@ -591,7 +502,7 @@ except Exception as e:
         log.error("Не удалось создать BybitClient: %s", e)
         bybit = BybitClient()
 
-    # восстановим задачи расписания
+    # Восстановим задачи
     try:
         for user_id, _pairs, freq, _sens, _cat in store.all_users():
             asyncio.get_event_loop().run_until_complete(
@@ -600,7 +511,7 @@ except Exception as e:
     except Exception as e:
         log.warning("Не удалось восстановить задачи: %s", e)
 
-    # префлайт: на всякий случай снимаем вебхук перед polling
+    # Префлайт: уберём вебхук
     asyncio.get_event_loop().run_until_complete(_preflight(application))
 
     log.info("Бот запущен. Ожидаю команды…")

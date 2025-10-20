@@ -36,6 +36,7 @@ def init_sentry():
         log.warning("Sentry: init failed: %s", e)
         return False
 
+
 async def sentrytest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         import sentry_sdk
@@ -44,6 +45,7 @@ async def sentrytest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Готово. Проверь Sentry → Issues.")
     except Exception as e:
         await update.message.reply_text(f"Sentry недоступен: {e}")
+
 
 async def sentryboom_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("💥 Генерирую исключение и отправляю в Sentry…")
@@ -58,6 +60,7 @@ async def sentryboom_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as sx:
             await update.message.reply_text(f"Sentry недоступен: {sx}")
 
+
 # ---------- ОБЩЕЕ ----------
 WELCOME = (
     "Привет! Я крипто-бот.\n"
@@ -66,11 +69,14 @@ WELCOME = (
     "Если бот в SAFE_MODE — доступны только базовые команды.\n"
 )
 
+
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong ✅")
 
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(WELCOME)
+
 
 async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db_url = os.getenv("DATABASE_URL", "")
@@ -88,6 +94,7 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Build at: {build_ts}"
     )
 
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.error("Exception in handler", exc_info=context.error)
     try:
@@ -98,19 +105,20 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     except Exception:
         pass
 
+
 # ---------- ПОЛНЫЙ РЕЖИМ ----------
-# Импортируем тяжёлые зависимости ТОЛЬКО в полном режиме,
-# чтобы в SafeMode нечему было падать.
 def run_full(application, settings):
+    """
+    Тяжёлые импорты и полная логика — только здесь, чтобы SafeMode не падал.
+    """
     log.info("[FULL] Boot: importing modules…")
-    from src.config import Settings       # noqa
-    from src.storage import Storage       # noqa
-    from src.scheduler import BotScheduler # noqa
-    from src.utils import (               # noqa
+    from src.storage import Storage                      # noqa
+    from src.scheduler import BotScheduler                # noqa
+    from src.utils import (                               # noqa
         parse_frequency, norm_pairs, validate_sensitivity, ParseError,
         validate_category, CONF_THRESHOLDS
     )
-    from .analysis import analyze_and_decide  # noqa
+    from .analysis import analyze_and_decide              # noqa
 
     # Bybit fallback
     try:
@@ -126,7 +134,7 @@ def run_full(application, settings):
     scheduler: Optional[BotScheduler] = None
     bybit: Optional[BybitClient] = None
 
-    # ------- handlers (полный) -------
+    # ---------- Внутренние хендлеры ----------
     async def _send_settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         assert store is not None and scheduler is not None
         user_id = update.effective_user.id  # type: ignore
@@ -134,18 +142,19 @@ def run_full(application, settings):
             store.upsert_user(user_id)
             await scheduler.upsert_user_job(user_id, 3600, check_job)
         row = store.get_user(user_id)
+        assert row is not None
         _, pairs, freq, sens, category = row
-        FREQ_PRESETS = [("1m","60"),("5m","300"),("15m","900"),("1h","3600"),("4h","14400"),("1d","86400")]
+        FREQ_PRESETS = [("1m", "60"), ("5m", "300"), ("15m", "900"), ("1h", "3600"), ("4h", "14400"), ("1d", "86400")]
         sens_row = [
-            InlineKeyboardButton(("• " if sens=="low" else "")+"low", callback_data="sens:low"),
-            InlineKeyboardButton(("• " if sens=="medium" else "")+"medium", callback_data="sens:medium"),
-            InlineKeyboardButton(("• " if sens=="high" else "")+"high", callback_data="sens:high"),
+            InlineKeyboardButton(("• " if sens == "low" else "") + "low", callback_data="sens:low"),
+            InlineKeyboardButton(("• " if sens == "medium" else "") + "medium", callback_data="sens:medium"),
+            InlineKeyboardButton(("• " if sens == "high" else "") + "high", callback_data="sens:high"),
         ]
         cat_row = [
-            InlineKeyboardButton(("• " if category=="spot" else "")+"spot", callback_data="cat:spot"),
-            InlineKeyboardButton(("• " if category=="linear" else "")+"linear", callback_data="cat:linear"),
+            InlineKeyboardButton(("• " if category == "spot" else "") + "spot", callback_data="cat:spot"),
+            InlineKeyboardButton(("• " if category == "linear" else "") + "linear", callback_data="cat:linear"),
         ]
-        freq_row = [InlineKeyboardButton(txt, callback_data=f"freq:{sec}") for (txt,sec) in FREQ_PRESETS]
+        freq_row = [InlineKeyboardButton(txt, callback_data=f"freq:{sec}") for (txt, sec) in FREQ_PRESETS]
         pairs_row = [InlineKeyboardButton("✏️ Изменить пары", callback_data="pairs:edit")]
         kb = InlineKeyboardMarkup([freq_row, sens_row, cat_row, pairs_row])
 
@@ -173,8 +182,10 @@ def run_full(application, settings):
         assert update.callback_query and update.effective_user
         q = update.callback_query
         data = (q.data or "").strip()
-        try: await q.answer(text=f"callback: {data}", show_alert=False)
-        except Exception: pass
+        try:
+            await q.answer(text=f"callback: {data}", show_alert=False)
+        except Exception:
+            pass
 
         try:
             if data.startswith("freq:"):
@@ -219,18 +230,21 @@ def run_full(application, settings):
 
     async def check_job(context: ContextTypes.DEFAULT_TYPE):
         user_id = (context.job.data or {}).get("user_id") if context.job else None
-        if user_id: await run_check_for_user(user_id, context)
+        if user_id:
+            await run_check_for_user(user_id, context)
 
     async def run_check_for_user(user_id: int, context: ContextTypes.DEFAULT_TYPE):
         row = store.get_user(user_id)  # type: ignore
-        if not row: return
+        if not row:
+            return
         _, pairs, freq, sens, category = row
-        conf_map = {'low':0.6,'medium':0.7,'high':0.8}
+        conf_map = {'low': 0.6, 'medium': 0.7, 'high': 0.8}
         conf_threshold = conf_map.get(sens, 0.6)
 
         for sym in pairs.split(","):
             sym = sym.strip().upper()
-            if not sym: continue
+            if not sym:
+                continue
             try:
                 pack = bybit.latest_ohlcv_pack(sym, category=category)  # type: ignore
             except Exception as e:
@@ -240,9 +254,9 @@ def run_full(application, settings):
             try:
                 res = analyze_and_decide(
                     symbol=sym, ohlcv_pack=pack, ma_window=21,
-                    macd_cfg={"fast":12,"slow":26,"signal":9},
+                    macd_cfg={"fast": 12, "slow": 26, "signal": 9},
                     sensitivity=sens,
-                    model=os.getenv("OPENAI_MODEL","gpt-4o-mini-2024-08-06"),
+                    model=os.getenv("OPENAI_MODEL", "gpt-4o-mini-2024-08-06"),
                     book_url=os.getenv("LITERATURE_URLS"),
                 )
             except Exception as e:
@@ -250,7 +264,7 @@ def run_full(application, settings):
                 continue
 
             buy = bool(res.get("buy_signal"))
-            rationale = res.get("rationale","")
+            rationale = res.get("rationale", "")
             if not buy:
                 await application.bot.send_message(chat_id=user_id, text=f"[NO SIGNAL] {sym}: {rationale}")
                 continue
@@ -262,7 +276,6 @@ def run_full(application, settings):
                 await application.bot.send_message(chat_id=user_id, text=f"[FILTERED] {sym}: confidence {conf:.2f} < {conf_threshold:.2f}")
                 continue
 
-            # лог и публикация (сокращённо)
             await application.bot.send_message(
                 chat_id=user_id,
                 text=(f"[SIGNAL] {sym}: buy (conf {conf:.2f})\nentry={entry}; tp={tp}; sl={sl}; h={horizon}")
@@ -273,8 +286,8 @@ def run_full(application, settings):
     # settings уже переданы в функцию
 
     log.info("[FULL] Step 2/4: init Storage & Scheduler…")
-    store = __import__("src.storage", fromlist=["Storage"]).storage.Storage()  # type: ignore
-    scheduler = __import__("src.scheduler", fromlist=["BotScheduler"]).scheduler.BotScheduler(application)  # type: ignore
+    store = Storage()
+    scheduler = BotScheduler(application)
 
     log.info("[FULL] Step 3/4: init BybitClient…")
     bybit = BybitClient(proxy_url=getattr(settings, "proxy_url", None))  # type: ignore
@@ -284,8 +297,6 @@ def run_full(application, settings):
     application.add_handler(CallbackQueryHandler(on_callback, pattern=".*"), group=0)
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_pairs_message), group=2)
     application.add_handler(CommandHandler("settings", settings_cmd))
-
-    # Остальные общие команды уже регистрируются ниже (start, ping, diag, sentry*).
 
     # Восстановим задачи
     try:
@@ -297,6 +308,7 @@ def run_full(application, settings):
     except Exception as e:
         log.warning("[FULL] restore jobs failed: %s", e)
 
+
 # ---------- MAIN ----------
 async def _preflight(app):
     try:
@@ -304,6 +316,7 @@ async def _preflight(app):
         log.info("Webhook deleted (preflight).")
     except Exception as e:
         log.warning("delete_webhook failed: %s", e)
+
 
 def main():
     load_dotenv()
@@ -330,7 +343,6 @@ def main():
     if safe_mode == "0":
         # Полный режим
         try:
-            # Ленивая загрузка Settings — как в твоём проекте
             from src.config import Settings
             settings = Settings.load()
         except Exception as e:
@@ -353,6 +365,7 @@ def main():
     except Conflict:
         log.error("Conflict: другой экземпляр уже запущен. Остановите его или смените токен.")
         raise
+
 
 if __name__ == "__main__":
     main()

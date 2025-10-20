@@ -83,6 +83,12 @@ WELCOME_FULL = (
     "/sentryboom — намеренно сгенерировать исключение (проверка Sentry)\n"
 )
 
+async def _noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # сюда можно поставить лёгкий лог, если нужно
+    # log.info("update received")
+    return
+
+
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong ✅")
 
@@ -487,7 +493,7 @@ def main():
     application.add_error_handler(error_handler)
 
     # Общие команды (есть в обоих режимах)
-    application.add_handler(TypeHandler(Update, lambda u, c: None), group=1)  # «тихий» логгер
+    application.add_handler(TypeHandler(Update, _noop), group=1)
     application.add_handler(CommandHandler("ping", ping_cmd))
     application.add_handler(CommandHandler("diag", diag_cmd))
     application.add_handler(CommandHandler("sentrytest", sentrytest_cmd))

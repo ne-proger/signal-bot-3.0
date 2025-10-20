@@ -99,6 +99,10 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sentry_state = "on" if (os.getenv("SENTRY_DSN") or "").strip() else "off"
     safe = os.getenv("SAFE_MODE", "1")
     build_ts = os.getenv("BUILD_AT", "") or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    
+    openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    openai_base  = os.getenv("OPENAI_BASE_URL", "api.openai.com")
+    
     await update.message.reply_text(
         "🧪 DIAG\n"
         f"SAFE_MODE: {safe}\n"
@@ -376,7 +380,7 @@ def run_full(application, settings):
                     ma_window=21,
                     macd_cfg={"fast": 12, "slow": 26, "signal": 9},
                     sensitivity=sens,
-                    model=os.getenv("OPENAI_MODEL", "gpt-4o-mini-2024-08-06"),
+                    model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
                     book_url=os.getenv("LITERATURE_URLS"),
                 )
             except Exception as e:

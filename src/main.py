@@ -84,10 +84,7 @@ WELCOME_FULL = (
 )
 
 async def _noop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # сюда можно поставить лёгкий лог, если нужно
-    # log.info("update received")
     return
-
 
 async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong ✅")
@@ -105,10 +102,7 @@ async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sentry_state = "on" if (os.getenv("SENTRY_DSN") or "").strip() else "off"
     safe = os.getenv("SAFE_MODE", "1")
     build_ts = os.getenv("BUILD_AT", "") or datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
-    
-    openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    openai_base  = os.getenv("OPENAI_BASE_URL", "api.openai.com")
-    
+
     await update.message.reply_text(
         "🧪 DIAG\n"
         f"SAFE_MODE: {safe}\n"
@@ -156,7 +150,23 @@ def run_full(application, settings):
     scheduler: Optional[BotScheduler] = None
     bybit: Optional[BybitClient] = None
 
-    # ---------- handlers ----------
+    # ---------- helpers ----------
+    def _resolve_channel_id():
+        """
+        Возвращает chat_id канала из TELEGRAM_CHANNEL_ID.
+        Поддержка: -100..., int или @username.
+        """
+        raw = (os.getenv("TELEGRAM_CHANNEL_ID") or "").strip()
+        if not raw:
+            return None
+        if raw.startswith("@"):
+            return raw  # username канала
+        try:
+            return int(raw)
+        except Exception:
+            # на всякий случай вернём как есть (строкой)
+            return raw
+
     async def ensure_user_row(user_id: int):
         assert store is not None and scheduler is not None
         if store.get_user(user_id) is None:
@@ -369,6 +379,8 @@ def run_full(application, settings):
             "",
         ]
 
+        channel_chat_id = _resolve_channel_id()  # ← добавлено
+
         for sym in pairs.split(","):
             sym = sym.strip().upper()
             if not sym:
@@ -401,7 +413,7 @@ def run_full(application, settings):
                 entry = res.get("entry"); tp = res.get("take_profit"); sl = res.get("stop_loss"); horizon = res.get("exit_horizon")
 
                 if conf >= conf_threshold:
-                    # публикация
+                    # сообщение
                     msg = (
                         f"🔔 SIGNAL BUY — {sym}\n"
                         f"entry: {entry}\n"
@@ -411,7 +423,16 @@ def run_full(application, settings):
                         f"confidence: {conf:.2f}\n"
                         f"rationale: {rationale}"
                     )
+                    # 1) личка пользователю (как и было)
                     await application.bot.send_message(chat_id=user_id, text=msg)
+
+                    # 2) публикация в канал (НОВОЕ)
+                    if channel_chat_id:
+                        try:
+                            await application.bot.send_message(chat_id=channel_chat_id, text=msg)
+                        except Exception as e:
+                            log.error("Не удалось отправить сигнал в канал %s: %s", channel_chat_id, e)
+
                     # лог в БД
                     store.log_signal(
                         user_id=user_id, symbol=sym, signal_type="buy",
